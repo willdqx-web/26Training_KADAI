@@ -209,19 +209,105 @@ def analyze_with_gemini(question: str) -> str:
     return response.text
 ```
 
-> **補足：本番実装に向けて**
-> このミニ課題ではGeminiの回答を1つの文字列として受け取っています。
-> 本番アプリではカテゴリ・緊急度・回答案をそれぞれ別のフィールドとして保存する必要があります。
-> プロンプトでJSON形式の出力を指示する方法（例: 「JSON形式で返してください」）を要件定義・設計フェーズで検討しましょう。
+# 8. 構造化出力（category・priority・answer を個別に取得する）
 
-# 8. 試す問い合わせ文
+セクション7のコードでは回答を1つの文字列として受け取っています。このままではカテゴリや緊急度を別々のフィールドとして保存したり画面に表示したりするときに「文字列を解析する処理」が別途必要になります。
+
+Gemini APIには **構造化出力（Structured Output）** という機能があり、返ってくるデータの形をあらかじめ指定できます。Pydanticモデルで形を定義しておくと、Geminiが自動でその形のJSONを返してくれます。
+
+## なぜ構造化出力が便利なのか
+
+| 方式 | Geminiからの返答例 | コードでの取り出し方 |
+| --- | --- | --- |
+| テキスト（セクション7） | `"カテゴリ: 休暇\n緊急度: 中\n回答案: ..."` | 文字列を行分割・検索して取り出す（壊れやすい） |
+| 構造化出力（このセクション） | `{"category": "休暇", "priority": "中", "answer": "..."}` | `result.category` のように直接取り出せる |
+
+## コード
+
+```python
+import os
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from pydantic import BaseModel
+
+load_dotenv()
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+
+
+class InquiryResult(BaseModel):
+    category: str
+    priority: str
+    answer: str
+
+
+def analyze_with_gemini_structured(question: str) -> InquiryResult:
+    prompt = f"""
+あなたは総務部門の問い合わせ一次回答担当です。
+社員からの問い合わせを読み、カテゴリ・緊急度・回答案を判定してください。
+
+- category: 問い合わせのカテゴリ（例: 休暇、備品、給与、保険、その他）
+- priority: 緊急度を「高」「中」「低」のいずれかで返す
+- answer: 社員への一次回答案（日本語、2〜3文程度）
+
+問い合わせ:
+{question}
+"""
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=InquiryResult,
+        ),
+    )
+    parsed = response.parsed
+    # SDKのバージョンによってリスト/タプルで返ることがある。
+    # isinstance ではなく属性の有無で判定する（カスタム型にも対応）
+    if not hasattr(parsed, 'category'):
+        parsed = parsed[0]
+    return parsed
+```
+
+## コードの解説
+
+| 部分 | 意味 |
+| --- | --- |
+| `class InquiryResult(BaseModel)` | 返ってくるデータの形を定義する。フィールド名とその型を書く |
+| `response_mime_type="application/json"` | GeminiにJSON形式で返すよう指示する |
+| `response_schema=InquiryResult` | 上で定義した形に合わせてJSONを返すよう指示する |
+| `response.parsed` | Geminiの返答をそのまま `InquiryResult` のインスタンスとして受け取る |
+| `hasattr(parsed, 'category')` | `category` 属性を持っていない（＝タプル/リストのまま）場合は `[0]` で先頭要素を取り出す。`isinstance` より確実 |
+
+## 使い方
+
+```python
+result = analyze_with_gemini_structured("健康保険証を紛失しました。再発行の手続きを教えてください。")
+
+print(result.category)   # → 保険
+print(result.priority)   # → 高
+print(result.answer)     # → 総務窓口へご連絡ください。…
+
+# FastAPIやJSON保存に渡すときはそのまま辞書にできる
+print(result.model_dump())
+# → {"category": "保険", "priority": "高", "answer": "..."}
+```
+
+> **補足：** `response.parsed` が `None` になる場合は `response_schema` の指定が正しいか、またはモデルがスキーマに対応しているか確認してください。`gemini-2.5-flash-lite` は構造化出力に対応しています。
+
+> **補足：タプルで返ってくる場合について**
+> `response.parsed` が `(InquiryResult(...),)` のようなタプル形式で返るのは、SDKのバージョン差異によるものです。上のコードでは `isinstance` チェックを入れているため、どちらの形式でも `result.category` のように取り出せます。
+
+# 9. 試す問い合わせ文
 
 ```
 健康保険証を紛失してしまいました。
 病院を受診する予定があるため、再発行の手続きと急ぎの対応方法を教えてください。
 ```
 
-# 9. 動作確認
+# 10. 動作確認
 
 - [ ] .envからAPIキーを読み込める。
 
@@ -233,7 +319,7 @@ def analyze_with_gemini(question: str) -> str:
 
 - [ ] API失敗時に画面へ分かりやすいエラーを表示できる。
 
-# 10. よくあるエラー
+# 11. よくあるエラー
 
 | 現象 | 確認すること |
 | --- | --- |
@@ -241,7 +327,7 @@ def analyze_with_gemini(question: str) -> str:
 | ModuleNotFoundError: google | uv pip install google-genai python-dotenvを実行したか確認する。 |
 | 回答が期待通りでない | プロンプトに出力形式や役割を明確に書く。 |
 
-# 11. 本番設計につながる問い
+# 12. 本番設計につながる問い
 
 - [ ] Geminiの回答をそのまま保存してよいか。
 
@@ -251,7 +337,7 @@ def analyze_with_gemini(question: str) -> str:
 
 - [ ] Geminiの回答文字列をカテゴリ・緊急度・回答案に分離するにはどうすればよいか。
 
-# 12. 振り返り
+# 13. 振り返り
 
 このミニ課題で学んだこと：
 
